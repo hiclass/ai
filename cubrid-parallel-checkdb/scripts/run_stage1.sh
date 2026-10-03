@@ -1,7 +1,7 @@
 #!/bin/bash
 # Stage 1: N concurrent checkdb processes, each on a disjoint bucket of tables (no engine change needed).
 # Buckets are balanced greedily by row count (largest tables first, each to the lightest bucket).
-set -euo pipefail
+set -uo pipefail
 . "$(dirname "$0")/env.sh"
 N=${1:-1}
 cd "$WORK"

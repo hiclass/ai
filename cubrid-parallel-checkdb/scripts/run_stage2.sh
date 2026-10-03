@@ -3,7 +3,7 @@
 #   mode "tables"  : cubrid checkdb -C -i tables.txt   (per-table path, xboot_checkdb_table)
 #   mode "db"      : cubrid checkdb -C                 (whole-database path, same as backupdb's pre-check)
 #   mode "backup"  : cubrid backupdb -C                (backup with the consistency check, output to /dev/null)
-set -euo pipefail
+set -uo pipefail
 . "$(dirname "$0")/env.sh"
 N=${1:-1}; MODE=${2:-tables}
 cd "$WORK"

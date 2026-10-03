@@ -50,7 +50,7 @@ index 844f3db..5333b2c 100644
  typedef enum param_id PARAM_ID;
  
 diff --git a/src/transaction/boot_sr.c b/src/transaction/boot_sr.c
-index 2886bef..d332932 100644
+index 2886bef..95b744b 100644
 --- a/src/transaction/boot_sr.c
 +++ b/src/transaction/boot_sr.c
 @@ -106,6 +106,16 @@
@@ -70,7 +70,7 @@ index 2886bef..d332932 100644
  // XXX: SHOULD BE THE LAST INCLUDE HEADER
  #include "memory_wrapper.hpp"
  
-@@ -3714,6 +3724,457 @@ xcallback_console_print (THREAD_ENTRY * thread_p, char *print_str)
+@@ -3714,6 +3724,504 @@ xcallback_console_print (THREAD_ENTRY * thread_p, char *print_str)
  }
  #endif
  
@@ -89,6 +89,7 @@ index 2886bef..d332932 100644
 + * checkdb_worker_count = 1 (default) keeps the serial code path untouched.
 + */
 +
++static int boot_checkdb_class_hfid (THREAD_ENTRY * thread_p, OID * class_oid, HFID * hfid);
 +static DISK_ISVALID boot_checkdb_class_by_flags (THREAD_ENTRY * thread_p, int check_flag, OID * class_oid);
 +static int boot_checkdb_class_npages (THREAD_ENTRY * thread_p, OID * class_oid);
 +static int boot_checkdb_collect_class_oids (THREAD_ENTRY * thread_p, std::vector < OID > &class_oids);
@@ -195,6 +196,44 @@ index 2886bef..d332932 100644
 +// *INDENT-ON*
 +
 +/*
++ * boot_checkdb_class_hfid () - heap file of a class, read from its class record
++ *
++ * return	  : error code
++ * thread_p (in)  : thread entry
++ * class_oid (in) : class
++ * hfid (out)	  : heap file; NULL HFID for a class without a heap (view)
++ *
++ * Note: heap_get_class_info () cannot be used here: it fetches the heap file header, which does not exist for a
++ *	 view and is reported as a fatal page error.
++ */
++static int
++boot_checkdb_class_hfid (THREAD_ENTRY * thread_p, OID * class_oid, HFID * hfid)
++{
++  HEAP_SCANCACHE scan_cache;
++  RECDES peek_recdes = RECDES_INITIALIZER;
++  int error_code;
++
++  HFID_SET_NULL (hfid);
++
++  error_code = heap_scancache_quick_start_root_hfid (thread_p, &scan_cache);
++  if (error_code != NO_ERROR)
++    {
++      ASSERT_ERROR ();
++      return error_code;
++    }
++  if (heap_get_class_record (thread_p, class_oid, &peek_recdes, &scan_cache, PEEK) != S_SUCCESS)
++    {
++      heap_scancache_end (thread_p, &scan_cache);
++      ASSERT_ERROR_AND_SET (error_code);
++      return error_code;
++    }
++  or_class_hfid (&peek_recdes, hfid);
++  heap_scancache_end (thread_p, &scan_cache);
++
++  return NO_ERROR;
++}
++
++/*
 + * boot_checkdb_class_by_flags () - whole-database check restricted to one class: its heap pages, its b-trees and
 + *				     the heap/b-tree cross check, as selected by check_flag.
 + *
@@ -220,14 +259,14 @@ index 2886bef..d332932 100644
 +      return DISK_VALID;
 +    }
 +
-+  if (heap_get_class_info (thread_p, class_oid, &hfid, NULL, NULL) != NO_ERROR)
++  if (boot_checkdb_class_hfid (thread_p, class_oid, &hfid) != NO_ERROR)
 +    {
 +      lock_unlock_object (thread_p, class_oid, oid_Root_class_oid, IS_LOCK, true);
-+      ASSERT_ERROR ();
 +      return DISK_ERROR;
 +    }
 +  if (HFID_IS_NULL (&hfid))
 +    {
++      /* a view: nothing to check */
 +      lock_unlock_object (thread_p, class_oid, oid_Root_class_oid, IS_LOCK, true);
 +      return DISK_VALID;
 +    }
@@ -290,7 +329,7 @@ index 2886bef..d332932 100644
 +  HFID hfid;
 +  int npages = 0;
 +
-+  if (heap_get_class_info (thread_p, class_oid, &hfid, NULL, NULL) != NO_ERROR || HFID_IS_NULL (&hfid)
++  if (boot_checkdb_class_hfid (thread_p, class_oid, &hfid) != NO_ERROR || HFID_IS_NULL (&hfid)
 +      || file_get_num_user_pages (thread_p, &hfid.vfid, &npages) != NO_ERROR)
 +    {
 +      /* only a balancing hint; the check itself reports real errors */
@@ -340,6 +379,14 @@ index 2886bef..d332932 100644
 +
 +  while (heap_next (thread_p, &root_hfid, oid_Root_class_oid, &class_oid, &peek, &scan_cache, PEEK) == S_SUCCESS)
 +    {
++      HFID hfid;
++
++      or_class_hfid (&peek, &hfid);
++      if (HFID_IS_NULL (&hfid))
++	{
++	  /* a view: no heap, no indexes */
++	  continue;
++	}
 +      class_oids.push_back (class_oid);
 +    }
 +
@@ -528,7 +575,7 @@ index 2886bef..d332932 100644
  /*
   * xboot_check_db_consistency () - check consistency of database
   *                              as much as possible
-@@ -3728,6 +4189,7 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
+@@ -3728,6 +4236,7 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
    int i;
    bool repair = check_flag & CHECKDB_REPAIR;
    int error_code = NO_ERROR;
@@ -536,7 +583,7 @@ index 2886bef..d332932 100644
  
    disk_lock_extend ();
    error_code = boot_check_permanent_volumes (thread_p);
-@@ -3746,6 +4208,18 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
+@@ -3746,6 +4255,18 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
  
    if (num_oids > 0)
      {
@@ -555,7 +602,7 @@ index 2886bef..d332932 100644
        for (i = 0; i < num_oids; i++)
  	{
  	  if (OID_ISNULL (&oids[i]))
-@@ -3799,7 +4273,23 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
+@@ -3799,7 +4320,23 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
  	}
      }
  
@@ -580,7 +627,7 @@ index 2886bef..d332932 100644
      {
        if (isvalid != DISK_ERROR)
  	{
-@@ -3823,7 +4313,7 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
+@@ -3823,7 +4360,7 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
  	}
      }
  
@@ -589,7 +636,7 @@ index 2886bef..d332932 100644
      {
        if (isvalid != DISK_ERROR)
  	{
-@@ -3847,7 +4337,7 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
+@@ -3847,7 +4384,7 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
  	}
      }
  

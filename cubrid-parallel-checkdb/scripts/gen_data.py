@@ -18,10 +18,10 @@ with open(os.path.join(out, "index.sql"), "w") as f:
     for t in tables:
         f.write(f"CREATE INDEX i_{t}_k1 ON {t} (k1);\nCREATE INDEX i_{t}_k2 ON {t} (k2);\n")
 with open(os.path.join(out, "tables.txt"), "w") as f:
-    f.write("\n".join(tables) + "\n")
+    f.write("\n".join("dba." + t for t in tables) + "\n")
 with open(os.path.join(out, "table_sizes.txt"), "w") as f:
     for t, n in zip(tables, sizes):
-        f.write(f"{t} {n}\n")
+        f.write(f"dba.{t} {n}\n")
 
 alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
 def payload(i):
