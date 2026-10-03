@@ -1,0 +1,33 @@
+=== Sat Oct  3 05:51:58 UTC 2026 nproc=4 ===
+stage1 procs=1 elapsed=178.44 rc=0
+stage1 procs=2 elapsed=96.46 rc=0
+stage1 procs=4 elapsed=49.03 rc=0
+stage1 procs=8 elapsed=51.71 rc=0
+stage2 mode=tables workers=1 elapsed=173.34 rc=0
+stage2 mode=tables workers=2 elapsed=57.74 rc=0
+stage2 mode=tables workers=4 elapsed=40.18 rc=0
+stage2 mode=tables workers=8 elapsed=61.27 rc=0
+stage2 mode=db workers=1 elapsed=175.08 rc=0
+stage2 mode=db workers=2 elapsed=57.59 rc=0
+stage2 mode=db workers=4 elapsed=37.40 rc=0
+stage2 mode=db workers=8 elapsed=55.23 rc=0
+stage2 mode=backup workers=1 elapsed=11.02 rc=0
+stage2 mode=backup workers=4 elapsed=6.85 rc=0
+stage1 procs=1 elapsed=176.66 rc=0
+stage1 procs=2 elapsed=92.87 rc=0
+stage1 procs=4 elapsed=53.06 rc=0
+stage1 procs=8 elapsed=55.42 rc=0
+stage2 mode=tables workers=1 elapsed=171.29 rc=0
+stage2 mode=tables workers=2 elapsed=57.02 rc=0
+stage2 mode=tables workers=4 elapsed=37.43 rc=0
+stage2 mode=tables workers=8 elapsed=54.47 rc=0
+stage2 mode=db workers=1 elapsed=174.91 rc=0
+stage2 mode=db workers=2 elapsed=58.34 rc=0
+stage2 mode=db workers=4 elapsed=36.36 rc=0
+stage2 mode=db workers=8 elapsed=54.30 rc=0
+stage2 mode=backup workers=1 elapsed=9.48 rc=0
+stage2 mode=backup workers=4 elapsed=7.07 rc=0
+stage2 mode=bkflags workers=1 elapsed=4.05 rc=0
+stage2 mode=bkflags workers=4 elapsed=1.57 rc=0
+stage2 mode=xcheck workers=1 elapsed=160.27 rc=0
+stage2 mode=xcheck workers=4 elapsed=36.18 rc=0
