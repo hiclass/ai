@@ -1,0 +1,600 @@
+diff --git a/src/base/system_parameter.c b/src/base/system_parameter.c
+index d646686..b1b897e 100644
+--- a/src/base/system_parameter.c
++++ b/src/base/system_parameter.c
+@@ -817,6 +817,8 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
+ 
+ #define PRM_NAME_PLAN_CACHE_BIND_SENSITIVITY "plan_cache_bind_sensitivity"
+ 
++#define PRM_NAME_CHECKDB_WORKER_COUNT "checkdb_worker_count"
++
+ // #endregion 
+ 
+ /*
+@@ -5535,6 +5537,21 @@ SYSPRM_PARAM prm_Def[] = {
+    (char *) NULL,
+    (DUP_PRM_FUNC) NULL,
+    (DUP_PRM_FUNC) NULL},
++  /* checkdb_worker_count: workers for the per-class consistency checks (checkdb, backupdb pre-check).
++   * 1 keeps the serial walk; 2 or more spreads heap, b-tree and heap/b-tree cross checks over the
++   * parallel-query worker pool (bounded by max_parallel_workers). */
++  {PRM_ID_CHECKDB_WORKER_COUNT,
++   PRM_NAME_CHECKDB_WORKER_COUNT,
++   (PRM_FOR_SERVER | PRM_USER_CHANGE),
++   PRM_INTEGER,
++   PRM_CLEAR_DYNAMIC_FLAG,
++   {false, {.i = 1}},
++   {false, {.i = 1}},
++   {false, {.i = 64}},
++   {false, {.i = 1}},
++   (char *) NULL,
++   (DUP_PRM_FUNC) NULL,
++   (DUP_PRM_FUNC) NULL},
+ };
+ 
+ /* The PL server (cub_pl) is a separate Java process that hard-codes the ordinals of the
+diff --git a/src/base/system_parameter.h b/src/base/system_parameter.h
+index 844f3db..5333b2c 100644
+--- a/src/base/system_parameter.h
++++ b/src/base/system_parameter.h
+@@ -551,8 +551,10 @@ enum param_id
+ 
+   PRM_ID_PLAN_CACHE_BIND_SENSITIVITY,
+ 
++  PRM_ID_CHECKDB_WORKER_COUNT,
++
+   /* change PRM_LAST_ID when adding new system parameters */
+-  PRM_LAST_ID = PRM_ID_PLAN_CACHE_BIND_SENSITIVITY
++  PRM_LAST_ID = PRM_ID_CHECKDB_WORKER_COUNT
+ };
+ typedef enum param_id PARAM_ID;
+ 
+diff --git a/src/transaction/boot_sr.c b/src/transaction/boot_sr.c
+index 2886bef..d332932 100644
+--- a/src/transaction/boot_sr.c
++++ b/src/transaction/boot_sr.c
+@@ -106,6 +106,16 @@
+ #include "dblink_2pc_daemon.h"
+ #endif /* CCI_XA */
+ 
++#if defined (SERVER_MODE)
++#include "object_representation_sr.h"
++#include "px_worker_manager.hpp"
++#include "thread_entry_task.hpp"
++#endif /* SERVER_MODE */
++
++#include <algorithm>
++#include <atomic>
++#include <vector>
++
+ // XXX: SHOULD BE THE LAST INCLUDE HEADER
+ #include "memory_wrapper.hpp"
+ 
+@@ -3714,6 +3724,457 @@ xcallback_console_print (THREAD_ENTRY * thread_p, char *print_str)
+ }
+ #endif
+ 
++#if defined (SERVER_MODE)
++/*
++ * Parallel consistency check
++ *
++ * The per-class checks (heap pages, b-trees, heap/b-tree cross check) are independent of each other: every one
++ * takes its own class lock, keeps its state in locals and never writes. They are therefore spread over the
++ * parallel-query worker pool, one task per worker, each task owning a bucket of classes. Workers borrow the
++ * requesting transaction (same tran_index and connection), exactly like parallel scan and histogram sampling, so
++ * class locks and the MVCC snapshot are shared. The requesting thread waits for the buckets and re-raises the
++ * first worker error in its own error context.
++ *
++ * Checks that walk global structures (disk, file tracker, catalog, class names) and every repair mode stay serial.
++ * checkdb_worker_count = 1 (default) keeps the serial code path untouched.
++ */
++
++static DISK_ISVALID boot_checkdb_class_by_flags (THREAD_ENTRY * thread_p, int check_flag, OID * class_oid);
++static int boot_checkdb_class_npages (THREAD_ENTRY * thread_p, OID * class_oid);
++static int boot_checkdb_collect_class_oids (THREAD_ENTRY * thread_p, std::vector < OID > &class_oids);
++static int boot_checkdb_parallel (THREAD_ENTRY * thread_p, int check_flag, OID * oids, int num_oids,
++				  BTID * index_btid, bool * done);
++
++// *INDENT-OFF*
++namespace
++{
++  struct boot_checkdb_bucket
++  {
++    std::vector<OID> class_oids;
++    int npages = 0;			/* heap pages assigned; only used to balance the buckets */
++    DISK_ISVALID valid = DISK_VALID;
++    int er_area_len = 0;		/* > 0: er_area holds the first failed check's flattened error context */
++    alignas (sizeof (int)) char er_area[1024];
++  };
++
++  class boot_checkdb_task : public cubthread::entry_task
++  {
++    public:
++      boot_checkdb_task (int check_flag, BTID *index_btid, bool table_mode, boot_checkdb_bucket *bucket,
++			 THREAD_ENTRY *parent, parallel_query::worker_manager *wm, std::atomic<bool> *abort_flag,
++			 std::atomic<int> *in_flight)
++	: m_check_flag (check_flag)
++	, m_index_btid (index_btid)
++	, m_table_mode (table_mode)
++	, m_bucket (bucket)
++	, m_parent (parent)
++	, m_wm (wm)
++	, m_abort (abort_flag)
++	, m_in_flight (in_flight)
++      {
++      }
++
++      void execute (cubthread::entry &thread_ref) override
++      {
++	/* borrow the requester's transaction and connection (mirrors parallel scan and histogram sampler tasks) */
++	thread_ref.m_px_orig_thread_entry = m_parent;
++	thread_ref.conn_entry = m_parent->conn_entry;
++	thread_ref.tran_index = m_parent->tran_index;
++	thread_ref.on_trace = false;
++
++	for (OID &class_oid : m_bucket->class_oids)
++	  {
++	    DISK_ISVALID valid;
++
++	    if (m_abort->load (std::memory_order_relaxed))
++	      {
++		break;
++	      }
++
++	    if (m_table_mode)
++	      {
++		valid = xboot_checkdb_table (&thread_ref, m_check_flag, &class_oid, m_index_btid);
++	      }
++	    else
++	      {
++		valid = boot_checkdb_class_by_flags (&thread_ref, m_check_flag, &class_oid);
++	      }
++
++	    if (valid == DISK_VALID)
++	      {
++		continue;
++	      }
++	    if (m_bucket->valid == DISK_VALID || valid == DISK_ERROR)
++	      {
++		m_bucket->valid = valid;
++	      }
++	    if (valid == DISK_ERROR && m_bucket->er_area_len == 0)
++	      {
++		/* the worker's error context is thread-local and gone once the pooled thread moves on; keep a copy
++		 * so the requester can raise the real cause */
++		m_bucket->er_area_len = (int) sizeof (m_bucket->er_area);
++		er_get_area_error (m_bucket->er_area, &m_bucket->er_area_len);
++	      }
++	    /* keep checking the remaining classes, as the serial loop does: one bad class must not hide the others */
++	  }
++
++	/* detach from the requester before the pooled thread goes idle */
++	thread_ref.conn_entry = NULL;
++	thread_ref.tran_index = NULL_TRAN_INDEX;
++	thread_ref.m_px_orig_thread_entry = NULL;
++      }
++
++      void retire () override
++      {
++	m_wm->pop_task ();
++	m_in_flight->fetch_sub (1, std::memory_order_release);
++	delete this;
++      }
++
++    private:
++      int m_check_flag;
++      BTID *m_index_btid;
++      bool m_table_mode;		/* true: checkdb table list (xboot_checkdb_table); false: whole database by flags */
++      boot_checkdb_bucket *m_bucket;
++      THREAD_ENTRY *m_parent;
++      parallel_query::worker_manager *m_wm;
++      std::atomic<bool> *m_abort;
++      std::atomic<int> *m_in_flight;
++  };
++}
++// *INDENT-ON*
++
++/*
++ * boot_checkdb_class_by_flags () - whole-database check restricted to one class: its heap pages, its b-trees and
++ *				     the heap/b-tree cross check, as selected by check_flag.
++ *
++ * return	   : DISK_VALID, DISK_INVALID or DISK_ERROR
++ * thread_p (in)   : thread entry
++ * check_flag (in) : CHECKDB_* flags
++ * class_oid (in)  : class to check
++ *
++ * Note: best effort like the serial file tracker walk: a class under schema change (conditional lock refused) and a
++ *	 class without a heap (view) are skipped.
++ */
++static DISK_ISVALID
++boot_checkdb_class_by_flags (THREAD_ENTRY * thread_p, int check_flag, OID * class_oid)
++{
++  HFID hfid;
++  DISK_ISVALID allvalid = DISK_VALID;
++  DISK_ISVALID valid;
++
++  if (lock_object (thread_p, class_oid, oid_Root_class_oid, IS_LOCK, LK_COND_LOCK) != LK_GRANTED)
++    {
++      er_log_debug (ARG_FILE_LINE, "checkdb: skipping class %d|%d|%d, conditional lock refused\n",
++		    OID_AS_ARGS (class_oid));
++      return DISK_VALID;
++    }
++
++  if (heap_get_class_info (thread_p, class_oid, &hfid, NULL, NULL) != NO_ERROR)
++    {
++      lock_unlock_object (thread_p, class_oid, oid_Root_class_oid, IS_LOCK, true);
++      ASSERT_ERROR ();
++      return DISK_ERROR;
++    }
++  if (HFID_IS_NULL (&hfid))
++    {
++      lock_unlock_object (thread_p, class_oid, oid_Root_class_oid, IS_LOCK, true);
++      return DISK_VALID;
++    }
++
++  if (check_flag & CHECKDB_HEAP_CHECK_ALLHEAPS)
++    {
++      valid = heap_check_heap_file (thread_p, &hfid);
++      if (valid == DISK_ERROR)
++	{
++	  lock_unlock_object (thread_p, class_oid, oid_Root_class_oid, IS_LOCK, true);
++	  return DISK_ERROR;
++	}
++      if (valid != DISK_VALID)
++	{
++	  allvalid = valid;
++	}
++    }
++
++  lock_unlock_object (thread_p, class_oid, oid_Root_class_oid, IS_LOCK, true);
++
++  if (check_flag & CHECKDB_BTREE_CHECK_ALL_BTREES)
++    {
++      valid = btree_check_by_class_oid (thread_p, class_oid, NULL);
++      if (valid == DISK_ERROR)
++	{
++	  return DISK_ERROR;
++	}
++      if (valid != DISK_VALID)
++	{
++	  allvalid = valid;
++	}
++    }
++
++  if (check_flag & CHECKDB_LC_CHECK_ALLENTRIES_OF_ALLBTREES)
++    {
++      valid = locator_check_by_class_oid (thread_p, class_oid, &hfid, NULL, false);
++      if (valid == DISK_ERROR)
++	{
++	  return DISK_ERROR;
++	}
++      if (valid != DISK_VALID)
++	{
++	  allvalid = valid;
++	}
++    }
++
++  return allvalid;
++}
++
++/*
++ * boot_checkdb_class_npages () - heap page count of a class, as a hint for balancing the worker buckets
++ *
++ * return	  : page count, 0 when unknown
++ * thread_p (in)  : thread entry
++ * class_oid (in) : class
++ */
++static int
++boot_checkdb_class_npages (THREAD_ENTRY * thread_p, OID * class_oid)
++{
++  HFID hfid;
++  int npages = 0;
++
++  if (heap_get_class_info (thread_p, class_oid, &hfid, NULL, NULL) != NO_ERROR || HFID_IS_NULL (&hfid)
++      || file_get_num_user_pages (thread_p, &hfid.vfid, &npages) != NO_ERROR)
++    {
++      /* only a balancing hint; the check itself reports real errors */
++      er_clear ();
++      return 0;
++    }
++  return npages > 0 ? npages : 0;
++}
++
++/*
++ * boot_checkdb_collect_class_oids () - every class of the database, read from the root heap
++ *
++ * return	    : error code
++ * thread_p (in)    : thread entry
++ * class_oids (out) : class OIDs
++ */
++static int
++boot_checkdb_collect_class_oids (THREAD_ENTRY * thread_p, std::vector < OID > &class_oids)
++{
++  HFID root_hfid;
++  HEAP_SCANCACHE scan_cache;
++  RECDES peek = RECDES_INITIALIZER;
++  OID class_oid;
++  MVCC_SNAPSHOT *mvcc_snapshot = logtb_get_mvcc_snapshot (thread_p);
++
++  if (mvcc_snapshot == NULL)
++    {
++      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_GENERIC_ERROR, 0);
++      return ER_GENERIC_ERROR;
++    }
++
++  if (boot_find_root_heap (&root_hfid) != NO_ERROR || HFID_IS_NULL (&root_hfid))
++    {
++      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_GENERIC_ERROR, 0);
++      return ER_GENERIC_ERROR;
++    }
++
++  if (heap_scancache_start (thread_p, &scan_cache, &root_hfid, oid_Root_class_oid, true, mvcc_snapshot) != NO_ERROR)
++    {
++      ASSERT_ERROR ();
++      return er_errid ();
++    }
++
++  class_oid.volid = root_hfid.vfid.volid;
++  class_oid.pageid = NULL_PAGEID;
++  class_oid.slotid = NULL_SLOTID;
++
++  while (heap_next (thread_p, &root_hfid, oid_Root_class_oid, &class_oid, &peek, &scan_cache, PEEK) == S_SUCCESS)
++    {
++      class_oids.push_back (class_oid);
++    }
++
++  heap_scancache_end (thread_p, &scan_cache);
++
++  return NO_ERROR;
++}
++
++/*
++ * boot_checkdb_parallel () - run the per-class checks over the parallel-query worker pool
++ *
++ * return	   : NO_ERROR, or an error code with the first worker error raised in this thread's error context
++ * thread_p (in)   : requesting thread
++ * check_flag (in) : CHECKDB_* flags
++ * oids (in)	   : class list (table mode) or NULL (every class)
++ * num_oids (in)   : size of oids
++ * index_btid (in) : table mode only: single index to check, or NULL
++ * done (out)	   : false when the parallel path was not used (checkdb_worker_count < 2, fewer than two classes,
++ *		     or every worker busy): nothing has been checked and the caller runs the serial code
++ */
++static int
++boot_checkdb_parallel (THREAD_ENTRY * thread_p, int check_flag, OID * oids, int num_oids, BTID * index_btid,
++		       bool * done)
++{
++  std::vector < OID > class_oids;
++  std::vector < int >class_npages;
++  std::vector < size_t > order;
++  std::vector < boot_checkdb_bucket > buckets;
++  parallel_query::worker_manager * wm = NULL;
++  std::atomic < bool > abort_flag (false);
++  std::atomic < int >in_flight (0);
++  int workers = prm_get_integer_value (PRM_ID_CHECKDB_WORKER_COUNT);
++  int degree;
++  int first_error_bucket = -1;
++  DISK_ISVALID allvalid = DISK_VALID;
++  bool table_mode = (num_oids > 0);
++  bool interrupted = false;
++  bool continue_checking = true;
++  size_t i;
++  int b;
++
++  *done = false;
++
++  if (workers < 2)
++    {
++      return NO_ERROR;
++    }
++
++  if (table_mode)
++    {
++      for (b = 0; b < num_oids; b++)
++	{
++	  if (!OID_ISNULL (&oids[b]))
++	    {
++	      class_oids.push_back (oids[b]);
++	    }
++	}
++    }
++  else
++    {
++      int error_code = boot_checkdb_collect_class_oids (thread_p, class_oids);
++      if (error_code != NO_ERROR)
++	{
++	  *done = true;
++	  return error_code;
++	}
++    }
++
++  if (class_oids.size () < 2)
++    {
++      return NO_ERROR;
++    }
++
++  degree = (int) std::min ((size_t) workers, class_oids.size ());
++  wm = parallel_query::worker_manager::try_reserve_workers (degree);
++  if (wm == NULL)
++    {
++      /* every parallel worker is busy: the serial path is always available */
++      er_log_debug (ARG_FILE_LINE, "checkdb: no parallel worker available, running serially\n");
++      return NO_ERROR;
++    }
++  degree = wm->get_reserved_workers ();
++  if (degree < 2)
++    {
++      wm->release_workers ();
++      return NO_ERROR;
++    }
++
++  /* balance the buckets: largest heaps first, each to the lightest bucket so far */
++  class_npages.resize (class_oids.size (), 0);
++  order.resize (class_oids.size ());
++  for (i = 0; i < class_oids.size (); i++)
++    {
++      class_npages[i] = boot_checkdb_class_npages (thread_p, &class_oids[i]);
++      order[i] = i;
++    }
++  // *INDENT-OFF*
++  std::sort (order.begin (), order.end (), [&class_npages] (size_t a, size_t b)
++	     {
++	       return class_npages[a] > class_npages[b];
++	     });
++  // *INDENT-ON*
++  buckets.resize (degree);
++  for (size_t idx : order)
++    {
++      boot_checkdb_bucket *lightest = &buckets[0];
++      for (b = 1; b < degree; b++)
++	{
++	  if (buckets[b].npages < lightest->npages)
++	    {
++	      lightest = &buckets[b];
++	    }
++	}
++      lightest->class_oids.push_back (class_oids[idx]);
++      lightest->npages += class_npages[idx];
++    }
++
++  er_log_debug (ARG_FILE_LINE, "checkdb: %zu classes over %d workers (%s mode)\n", class_oids.size (), degree,
++		table_mode ? "table" : "database");
++
++  for (b = 0; b < degree; b++)
++    {
++      boot_checkdb_task *task =
++	new boot_checkdb_task (check_flag, index_btid, table_mode, &buckets[b], thread_p, wm, &abort_flag,
++			       &in_flight);
++      in_flight.fetch_add (1, std::memory_order_release);
++      wm->push_task (task);
++    }
++
++  /* wait for the buckets while keeping the requester's interrupt alive (ctrl-c on checkdb / backupdb) */
++  while (in_flight.load (std::memory_order_acquire) > 0)
++    {
++      thread_sleep (10);
++      if (!interrupted && logtb_is_interrupted (thread_p, true, &continue_checking))
++	{
++	  interrupted = true;
++	  abort_flag.store (true, std::memory_order_relaxed);
++	}
++    }
++  wm->release_workers ();	/* also frees wm */
++  wm = NULL;
++
++  *done = true;
++
++  for (b = 0; b < degree; b++)
++    {
++      if (buckets[b].valid == DISK_ERROR)
++	{
++	  if (first_error_bucket < 0)
++	    {
++	      first_error_bucket = b;
++	    }
++	  allvalid = DISK_ERROR;
++	}
++      else if (buckets[b].valid != DISK_VALID && allvalid == DISK_VALID)
++	{
++	  allvalid = buckets[b].valid;
++	}
++    }
++
++  if (interrupted)
++    {
++      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_INTERRUPTED, 0);
++      return ER_INTERRUPTED;
++    }
++  if (allvalid == DISK_VALID)
++    {
++      return NO_ERROR;
++    }
++  if (allvalid == DISK_ERROR && er_errid () == NO_ERROR)
++    {
++      if (first_error_bucket >= 0 && buckets[first_error_bucket].er_area_len > 0)
++	{
++	  /* re-raise the failed worker's error (code and message) here, so the client sees the real cause */
++	  (void) er_set_area_error (buckets[first_error_bucket].er_area);
++	}
++      else
++	{
++	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_GENERIC_ERROR, 0);
++	}
++    }
++  return ER_FAILED;
++}
++#endif /* SERVER_MODE */
++
+ /*
+  * xboot_check_db_consistency () - check consistency of database
+  *                              as much as possible
+@@ -3728,6 +4189,7 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
+   int i;
+   bool repair = check_flag & CHECKDB_REPAIR;
+   int error_code = NO_ERROR;
++  bool parallel_done = false;	/* per-class checks already done by boot_checkdb_parallel () */
+ 
+   disk_lock_extend ();
+   error_code = boot_check_permanent_volumes (thread_p);
+@@ -3746,6 +4208,18 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
+ 
+   if (num_oids > 0)
+     {
++#if defined (SERVER_MODE)
++      if (!repair && !(check_flag & (CHECKDB_CHECK_PREV_LINK | CHECKDB_REPAIR_PREV_LINK)))
++	{
++	  bool parallel_done = false;
++	  int parallel_error = boot_checkdb_parallel (thread_p, check_flag, oids, num_oids, index_btid, &parallel_done);
++
++	  if (parallel_done)
++	    {
++	      return (parallel_error != NO_ERROR) ? parallel_error : error_code;
++	    }
++	}
++#endif /* SERVER_MODE */
+       for (i = 0; i < num_oids; i++)
+ 	{
+ 	  if (OID_ISNULL (&oids[i]))
+@@ -3799,7 +4273,23 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
+ 	}
+     }
+ 
+-  if (check_flag & CHECKDB_HEAP_CHECK_ALLHEAPS)
++#if defined (SERVER_MODE)
++  if (isvalid != DISK_ERROR && !repair
++      && (check_flag & (CHECKDB_HEAP_CHECK_ALLHEAPS | CHECKDB_BTREE_CHECK_ALL_BTREES
++			| CHECKDB_LC_CHECK_ALLENTRIES_OF_ALLBTREES)))
++    {
++      /* heap, b-tree and heap/b-tree cross checks of every class, spread over the parallel workers; when the parallel
++       * path is not taken, the serial blocks below run as before */
++      int parallel_error = boot_checkdb_parallel (thread_p, check_flag, NULL, 0, NULL, &parallel_done);
++
++      if (parallel_done && parallel_error != NO_ERROR)
++	{
++	  error_code = (parallel_error == ER_INTERRUPTED) ? ER_INTERRUPTED : ER_FAILED;
++	}
++    }
++#endif /* SERVER_MODE */
++
++  if ((check_flag & CHECKDB_HEAP_CHECK_ALLHEAPS) && !parallel_done)
+     {
+       if (isvalid != DISK_ERROR)
+ 	{
+@@ -3823,7 +4313,7 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
+ 	}
+     }
+ 
+-  if (check_flag & CHECKDB_BTREE_CHECK_ALL_BTREES)
++  if ((check_flag & CHECKDB_BTREE_CHECK_ALL_BTREES) && !parallel_done)
+     {
+       if (isvalid != DISK_ERROR)
+ 	{
+@@ -3847,7 +4337,7 @@ xboot_check_db_consistency (THREAD_ENTRY * thread_p, int check_flag, OID * oids,
+ 	}
+     }
+ 
+-  if (check_flag & CHECKDB_LC_CHECK_ALLENTRIES_OF_ALLBTREES)
++  if ((check_flag & CHECKDB_LC_CHECK_ALLENTRIES_OF_ALLBTREES) && !parallel_done)
+     {
+       if (isvalid != DISK_ERROR)
+ 	{
